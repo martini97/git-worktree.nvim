@@ -1,304 +1,122 @@
-local Job = require('plenary.job')
-local Path = require('plenary.path')
-local Log = require('git-worktree.logger')
+local utils = require("git-worktree.utils")
+local config = require("git-worktree.config")
 
----@class GitWorktreeGitOps
+local vim = vim
+local logger = require("git-worktree.vlog"):new({ level = config.get().loglevel })
+
 local M = {}
 
--- A lot of this could be cleaned up if there was better job -> job -> function
--- communication.  That should be doable here in the near future
----
----@param path_str string path to the worktree to check
----@param branch string? branch the worktree is associated with
----@param cb any
-function M.has_worktree(path_str, branch, cb)
-    local found = false
-    local path
+---@class git-worktree.git.Worktree
+---@field worktree string
+---@field head string
+---@field branch string
 
-    if path_str == '.' then
-        path_str = vim.loop.cwd()
+---Returns worktrees for the current dir
+---@return git-worktree.git.Worktree[]
+function M.worktree_list()
+  ---@type git-worktree.git.Worktree[]
+  local worktrees = {}
+  local lines = assert(utils.system_lines("git", "worktree", "list", "--porcelain"), "failed to list git worktrees")
+
+  for _, line in pairs(lines) do
+    if #worktrees == 0 then
+      table.insert(worktrees, {})
     end
-
-    path = Path:new(path_str)
-    if not path:is_absolute() then
-        path = Path:new(string.format('%s' .. Path.path.sep .. '%s', vim.loop.cwd(), path_str))
+    local wt = worktrees[#worktrees]
+    if vim.startswith(line, "worktree") then
+      wt.worktree = vim.trim(line:sub(10))
+    elseif vim.startswith(line, "branch") then
+      wt.branch = vim.trim(line:sub(19))
+    elseif vim.startswith(line, "HEAD") then
+      wt.head = vim.trim(line:sub(6))
+    elseif line == "bare" then
+      wt.branch = "bare"
+      wt.head = "bare"
+    elseif line == "" then
+      table.insert(worktrees, {})
     end
-    path = path:absolute()
+  end
 
-    Log.debug('has_worktree: %s %s', path, branch)
-
-    local job = Job:new {
-        command = 'git',
-        args = { 'worktree', 'list', '--porcelain' },
-        on_stdout = function(_, line)
-            if line:match('^worktree ') then
-                local current_worktree = Path:new(line:match('^worktree (.+)$')):absolute()
-                Log.debug('current_worktree: "%s"', current_worktree)
-                if path == current_worktree then
-                    found = true
-                    return
-                end
-            elseif branch ~= nil and line:match('^branch ') then
-                local worktree_branch = line:match('^branch (.+)$')
-                Log.debug('worktree_branch: %s', worktree_branch)
-                if worktree_branch == 'refs/heads/' .. branch then
-                    found = true
-                    return
-                end
-            end
-        end,
-        cwd = vim.loop.cwd(),
-    }
-
-    job:after(function()
-        Log.debug('calling after')
-        cb(found)
-    end)
-
-    Log.debug('Checking for worktree %s', path)
-    job:start()
+  return worktrees
 end
 
---- @return string|nil
-function M.gitroot_dir()
-    local job = Job:new {
-        command = 'git',
-        args = { 'rev-parse', '--path-format=absolute', '--git-common-dir' },
-        cwd = vim.loop.cwd(),
-        on_stderr = function(_, data)
-            Log.error('ERROR: ' .. data)
-        end,
-    }
+---@param path? string
+---@param branch? string
+---@return git-worktree.git.Worktree?
+function M.worktree_find(path, branch)
+  local wts = M.worktree_list()
+  return vim.iter(wts):find(function(wt)
+    return (path and wt.path == path) or (branch and wt.branch == branch)
+  end)
+end
 
-    local stdout, code = job:sync()
-    if code ~= 0 then
-        Log.error(
-            'Error in determining the git root dir: code:'
-                .. tostring(code)
-                .. ' out: '
-                .. table.concat(stdout, '')
-                .. '.'
-        )
-        return nil
+---Return root dir (bare repo)
+---@return string?
+function M.root()
+  local lines = assert(
+    utils.system_lines("git", "rev-parse", "--path-format=absolute", "--git-common-dir"),
+    "failed to get root dir"
+  )
+  return lines[1]
+end
+
+---Return toplevel dir
+---@return string?
+function M.toplevel()
+  local lines = assert(
+    utils.system_lines("git", "rev-parse", "--path-format=absolute", "--show-toplevel"),
+    "failed to get toplevel dir"
+  )
+  return lines[1]
+end
+
+---List git branches
+---@param ... string extra args to pass branch command
+---@return string[]
+function M.branch_list(...)
+  local lines = assert(utils.system_lines("git", "branch", "--format=%(refname:short)", ...), "failed to list branches")
+  return lines
+end
+
+---Find branch by name
+---@param branch string
+---@param ... string extra args to pass branch command
+---@return string?
+function M.branch_find(branch, ...)
+  return vim.iter(M.branch_list(...)):find(branch)
+end
+
+---Create worktree
+---@param path string
+---@param branch? string
+---@param upstream? string
+---@return vim.SystemCompleted
+function M.worktree_create(path, branch, upstream)
+  local cmd = { "git", "worktree", "add" }
+
+  if branch == nil then
+    table.insert(cmd, "-d")
+    table.insert(cmd, path)
+    logger:debug("worktree_create", { cmd = cmd })
+    return vim.system(cmd, { text = true }):wait()
+  end
+
+  if not M.branch_find(branch) then
+    table.insert(cmd, "-b")
+    table.insert(cmd, branch)
+    table.insert(cmd, path)
+    if upstream and branch ~= upstream then
+      table.insert(cmd, "--track")
+      table.insert(cmd, upstream)
     end
+    logger:debug("worktree_create", { cmd = cmd })
+    return vim.system(cmd, { text = true }):wait()
+  end
 
-    return table.concat(stdout, '')
-end
-
---- @return string|nil
-function M.toplevel_dir()
-    local job = Job:new {
-        command = 'git',
-        args = { 'rev-parse', '--path-format=absolute', '--show-toplevel' },
-        cwd = vim.loop.cwd(),
-        on_stderr = function(_, data)
-            Log.error('ERROR: ' .. data)
-        end,
-    }
-
-    local stdout, code = job:sync()
-    if code ~= 0 then
-        Log.error(
-            'Error in determining the git root dir: code:'
-                .. tostring(code)
-                .. ' out: '
-                .. table.concat(stdout, '')
-                .. '.'
-        )
-        return nil
-    end
-
-    return table.concat(stdout, '')
-end
-
-function M.has_branch(branch, opts, cb)
-    local found = false
-    local args = { 'branch', '--format=%(refname:short)' }
-    opts = opts or {}
-    for _, opt in ipairs(opts) do
-        args[#args + 1] = opt
-    end
-
-    local job = Job:new {
-        command = 'git',
-        args = args,
-        on_stdout = function(_, data)
-            found = found or data == branch
-        end,
-        cwd = vim.loop.cwd(),
-    }
-
-    -- TODO: I really don't want status's spread everywhere... seems bad
-    job:after(function()
-        cb(found)
-    end):start()
-end
-
---- @param path string
---- @param branch string?
---- @param found_branch boolean
---- @param upstream string
---- @param found_upstream boolean
---- @return Job
-function M.create_worktree_job(path, branch, found_branch, upstream, found_upstream)
-    local worktree_add_cmd = 'git'
-    local worktree_add_args = { 'worktree', 'add' }
-
-    if branch == nil then
-        table.insert(worktree_add_args, '-d')
-        table.insert(worktree_add_args, path)
-    else
-        if not found_branch then
-            table.insert(worktree_add_args, '-b')
-            table.insert(worktree_add_args, branch)
-            table.insert(worktree_add_args, path)
-
-            if found_upstream and branch ~= upstream then
-                table.insert(worktree_add_args, '--track')
-                table.insert(worktree_add_args, upstream)
-            end
-        else
-            table.insert(worktree_add_args, path)
-            table.insert(worktree_add_args, branch)
-        end
-    end
-
-    return Job:new {
-        command = worktree_add_cmd,
-        args = worktree_add_args,
-        cwd = vim.loop.cwd(),
-        on_start = function()
-            Log.debug(worktree_add_cmd .. ' ' .. table.concat(worktree_add_args, ' '))
-        end,
-    }
-end
-
---- @param path string
---- @param force boolean
---- @return Job
-function M.delete_worktree_job(path, force)
-    local worktree_del_cmd = 'git'
-    local worktree_del_args = { 'worktree', 'remove', path }
-
-    if force then
-        table.insert(worktree_del_args, '--force')
-    end
-
-    return Job:new {
-        command = worktree_del_cmd,
-        args = worktree_del_args,
-        cwd = vim.loop.cwd(),
-        on_start = function()
-            Log.debug(worktree_del_cmd .. ' ' .. table.concat(worktree_del_args, ' '))
-        end,
-    }
-end
-
---- @param path string
---- @return Job
-function M.fetchall_job(path)
-    return Job:new {
-        command = 'git',
-        args = { 'fetch', '--all' },
-        cwd = path,
-        on_start = function()
-            Log.debug('git fetch --all (This may take a moment)')
-        end,
-    }
-end
-
---- @param path string
---- @param branch string
---- @param upstream string
---- @return Job
-function M.setbranch_job(path, branch, upstream)
-    local set_branch_cmd = 'git'
-    local set_branch_args = { 'branch', branch, string.format('--set-upstream-to=%s', upstream) }
-    return Job:new {
-        command = set_branch_cmd,
-        args = set_branch_args,
-        cwd = path,
-        on_start = function()
-            Log.debug(set_branch_cmd .. ' ' .. table.concat(set_branch_args, ' '))
-        end,
-    }
-end
-
---- @param path string
---- @param branch string
---- @param upstream string
---- @return Job
-function M.setpush_job(path, branch, upstream)
-    -- TODO: How to configure origin???  Should upstream ever be the push
-    -- destination?
-    local set_push_cmd = 'git'
-    local set_push_args = { 'push', '--set-upstream', upstream, branch, path }
-    return Job:new {
-        command = set_push_cmd,
-        args = set_push_args,
-        cwd = path,
-        on_start = function()
-            Log.debug(set_push_cmd .. ' ' .. table.concat(set_push_args, ' '))
-        end,
-    }
-end
-
---- @param path string
---- @return Job
-function M.rebase_job(path)
-    return Job:new {
-        command = 'git',
-        args = { 'rebase' },
-        cwd = path,
-        on_start = function()
-            Log.debug('git rebase')
-        end,
-    }
-end
-
---- @param path string
---- @return string|nil
-function M.parse_head(path)
-    local job = Job:new {
-        command = 'git',
-        args = { 'rev-parse', '--abbrev-ref', 'HEAD' },
-        cwd = path,
-        on_start = function()
-            Log.debug('git rev-parse --abbrev-ref HEAD')
-        end,
-    }
-
-    local stdout, code = job:sync()
-    if code ~= 0 then
-        Log.error('Error in parsing the HEAD: code:' .. tostring(code) .. ' out: ' .. table.concat(stdout, '') .. '.')
-        return nil
-    end
-
-    return table.concat(stdout, '')
-end
-
---- @param branch string
---- @return Job|nil
-function M.delete_branch_job(branch)
-    local root = M.gitroot_dir()
-    if root == nil then
-        return nil
-    end
-
-    local default = M.parse_head(root)
-    if default == branch then
-        print('Refusing to delete default branch')
-        return nil
-    end
-
-    return Job:new {
-        command = 'git',
-        args = { 'branch', '-D', branch },
-        cwd = M.gitroot_dir(),
-        on_start = function()
-            Log.debug('git branch -D')
-        end,
-    }
+  table.insert(cmd, path)
+  table.insert(cmd, branch)
+  logger:debug("worktree_create", { cmd = cmd })
+  return vim.system(cmd, { text = true }):wait()
 end
 
 return M
